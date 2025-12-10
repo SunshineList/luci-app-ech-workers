@@ -1,6 +1,6 @@
 #!/bin/sh /etc/rc.common
-# ECH Workers Proxy Service
-# procd init script
+# Tuple ECH Worker Proxy Service
+# procd init script with transparent proxy support
 
 USE_PROCD=1
 START=99
@@ -8,11 +8,105 @@ STOP=10
 
 NAME="ech-workers"
 BIN="/usr/bin/ech-workers"
+REDSOCKS_CONF="/tmp/ech-workers-redsocks.conf"
+REDSOCKS_PID="/tmp/ech-workers-redsocks.pid"
+
+# 清理 iptables 规则
+cleanup_iptables() {
+    iptables -t nat -D PREROUTING -i br-lan -j ECH_WORKERS 2>/dev/null
+    iptables -t nat -F ECH_WORKERS 2>/dev/null
+    iptables -t nat -X ECH_WORKERS 2>/dev/null
+    logger -t "$NAME" "已清理 iptables 规则"
+}
+
+# 设置 iptables 规则
+setup_iptables() {
+    local redir_port="$1"
+    
+    # 清理旧规则
+    cleanup_iptables
+    
+    # 创建自定义链
+    iptables -t nat -N ECH_WORKERS
+    
+    # 跳过本地和局域网地址
+    iptables -t nat -A ECH_WORKERS -d 0.0.0.0/8 -j RETURN
+    iptables -t nat -A ECH_WORKERS -d 10.0.0.0/8 -j RETURN
+    iptables -t nat -A ECH_WORKERS -d 127.0.0.0/8 -j RETURN
+    iptables -t nat -A ECH_WORKERS -d 169.254.0.0/16 -j RETURN
+    iptables -t nat -A ECH_WORKERS -d 172.16.0.0/12 -j RETURN
+    iptables -t nat -A ECH_WORKERS -d 192.168.0.0/16 -j RETURN
+    iptables -t nat -A ECH_WORKERS -d 224.0.0.0/4 -j RETURN
+    iptables -t nat -A ECH_WORKERS -d 240.0.0.0/4 -j RETURN
+    
+    # 重定向 TCP 流量到 redsocks
+    iptables -t nat -A ECH_WORKERS -p tcp -j REDIRECT --to-port "$redir_port"
+    
+    # 应用到 LAN 入口流量
+    iptables -t nat -A PREROUTING -i br-lan -j ECH_WORKERS
+    
+    logger -t "$NAME" "已设置透明代理 iptables 规则 (端口: $redir_port)"
+}
+
+# 启动 redsocks
+start_redsocks() {
+    local socks_port="$1"
+    local redir_port="$2"
+    
+    # 检查 redsocks 是否安装，如果没有则自动安装
+    if ! command -v redsocks >/dev/null 2>&1; then
+        logger -t "$NAME" "redsocks 未安装，正在自动安装..."
+        opkg update >/dev/null 2>&1
+        if opkg install redsocks >/dev/null 2>&1; then
+            logger -t "$NAME" "redsocks 安装成功"
+        else
+            logger -t "$NAME" "错误: redsocks 安装失败"
+            return 1
+        fi
+    fi
+    
+    # 生成配置文件
+    cat > "$REDSOCKS_CONF" <<EOF
+base {
+    log_debug = off;
+    log_info = on;
+    log = "syslog:daemon";
+    daemon = on;
+    redirector = iptables;
+}
+
+redsocks {
+    local_ip = 0.0.0.0;
+    local_port = $redir_port;
+    ip = 127.0.0.1;
+    port = $socks_port;
+    type = socks5;
+}
+EOF
+    
+    # 停止旧进程
+    [ -f "$REDSOCKS_PID" ] && kill $(cat "$REDSOCKS_PID") 2>/dev/null
+    
+    # 启动 redsocks
+    redsocks -c "$REDSOCKS_CONF" -p "$REDSOCKS_PID"
+    logger -t "$NAME" "redsocks 已启动 (监听: $redir_port -> SOCKS5: $socks_port)"
+}
+
+# 停止 redsocks
+stop_redsocks() {
+    if [ -f "$REDSOCKS_PID" ]; then
+        kill $(cat "$REDSOCKS_PID") 2>/dev/null
+        rm -f "$REDSOCKS_PID"
+    fi
+    rm -f "$REDSOCKS_CONF"
+    logger -t "$NAME" "redsocks 已停止"
+}
 
 start_service() {
     config_load "$NAME"
     
     local enabled server_addr listen_addr token best_ip dns ech_domain routing
+    local transparent_proxy redir_port
     
     config_get enabled "config" "enabled" "0"
     [ "$enabled" = "1" ] || return 0
@@ -29,11 +123,16 @@ start_service() {
     config_get dns "config" "dns" "dns.alidns.com/dns-query"
     config_get ech_domain "config" "ech_domain" "cloudflare-ech.com"
     config_get routing "config" "routing" "global"
+    config_get transparent_proxy "config" "transparent_proxy" "0"
+    config_get redir_port "config" "redir_port" "12345"
     
     [ ! -x "$BIN" ] && {
         logger -t "$NAME" "二进制文件不存在: $BIN"
         return 1
     }
+    
+    # 提取 SOCKS5 端口
+    local socks_port=$(echo "$listen_addr" | cut -d: -f2)
     
     procd_open_instance "$NAME"
     procd_set_param command "$BIN"
@@ -53,9 +152,18 @@ start_service() {
     procd_close_instance
     
     logger -t "$NAME" "服务已启动"
+    
+    # 启用透明代理
+    if [ "$transparent_proxy" = "1" ]; then
+        sleep 1  # 等待 ech-workers 启动
+        start_redsocks "$socks_port" "$redir_port" && setup_iptables "$redir_port"
+    fi
 }
 
 stop_service() {
+    # 清理透明代理
+    cleanup_iptables
+    stop_redsocks
     logger -t "$NAME" "服务已停止"
 }
 

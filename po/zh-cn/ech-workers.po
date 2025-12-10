@@ -87,3 +87,15 @@ msgstr "停止命令已发送"
 
 msgid "重启命令已发送"
 msgstr "重启命令已发送"
+
+msgid "透明代理"
+msgstr "透明代理"
+
+msgid "启用透明代理"
+msgstr "启用透明代理"
+
+msgid "重定向端口"
+msgstr "重定向端口"
+
+msgid "隐藏日志"
+msgstr "隐藏日志"
